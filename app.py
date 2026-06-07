@@ -395,9 +395,13 @@ def load_all():
 def build_portfolio(
     nav: pd.DataFrame, selections: list,
     start: pd.Timestamp = None, end: pd.Timestamp = None,
+    rebalance_freq: str = "none",
 ) -> pd.Series:
     """Build a portfolio's normalized growth series (starts at 1.0).
-    selections: list of (fund_name, weight%) tuples."""
+    selections: list of (fund_name, weight%) tuples.
+    rebalance_freq: 'none' (buy & hold), 'yearly', 'half-yearly', or 'quarterly'.
+    Rebalancing happens on the anniversary (or N-month anniversary) of the start
+    date — the portfolio's value is re-split back to the target weights."""
     funds = [f for f, _ in selections]
     weights = np.array([w for _, w in selections]) / 100.0
     sub = nav[funds]
@@ -408,8 +412,64 @@ def build_portfolio(
     sub = sub.dropna(how="any")
     if sub.empty:
         return pd.Series(dtype=float)
-    normalized = sub.divide(sub.iloc[0])
-    return pd.Series(normalized.values @ weights, index=sub.index)
+
+    # Buy and hold — original behavior
+    if rebalance_freq == "none":
+        normalized = sub.divide(sub.iloc[0])
+        return pd.Series(normalized.values @ weights, index=sub.index)
+
+    # Rebalanced version: between rebalance dates, behave like buy & hold.
+    # On each rebalance date, snapshot total value and re-split to target weights.
+    month_step = {"yearly": 12, "half-yearly": 6, "quarterly": 3}[rebalance_freq]
+
+    start_date = sub.index[0]
+    end_date = sub.index[-1]
+
+    # Build the list of rebalance "target" calendar dates (start, start+N, start+2N, ...)
+    rebalance_targets = []
+    step = 1
+    while True:
+        target = start_date + pd.DateOffset(months=month_step * step)
+        if target > end_date:
+            break
+        rebalance_targets.append(target)
+        step += 1
+
+    # Snap each target to the nearest available NAV date (next available trading day)
+    # so we always rebalance on a date that actually exists in our series
+    rebalance_dates = []
+    for t in rebalance_targets:
+        # Find first index >= target
+        idx_pos = sub.index.searchsorted(t)
+        if idx_pos < len(sub.index):
+            rebalance_dates.append(sub.index[idx_pos])
+    # Dedupe (in case two targets snap to the same trading day)
+    rebalance_dates = sorted(set(rebalance_dates))
+
+    # Walk through segments
+    portfolio_values = np.empty(len(sub), dtype=float)
+    current_value = 1.0  # start at 1.0
+    seg_start_idx = 0
+    # Segment boundaries: start, each rebalance date, end
+    boundary_idxs = [0] + [sub.index.get_loc(d) for d in rebalance_dates] + [len(sub) - 1]
+    # Remove duplicates while preserving order
+    seen = set()
+    boundary_idxs = [i for i in boundary_idxs if not (i in seen or seen.add(i))]
+
+    for b in range(len(boundary_idxs) - 1):
+        i_start = boundary_idxs[b]
+        i_end = boundary_idxs[b + 1]
+        # In this segment, each fund grows from its start value to its end value.
+        # Each fund holds (current_value * weight) initially. Its value at any
+        # time t inside the segment is: current_value * weight * (nav[t] / nav[i_start])
+        seg = sub.iloc[i_start : i_end + 1]
+        normalized = seg.divide(seg.iloc[0])
+        seg_values = (normalized.values * weights).sum(axis=1) * current_value
+        # Write into the output array (overlapping the last point of previous segment is fine)
+        portfolio_values[i_start : i_end + 1] = seg_values
+        current_value = seg_values[-1]  # rebalance happens "instantly" at i_end
+
+    return pd.Series(portfolio_values, index=sub.index)
 
 
 def rolling_cagr(series: pd.Series, window_days: int) -> pd.Series:
@@ -674,10 +734,11 @@ def column_html(name, dot_class, stats):
 # =============================================================================
 # Rolling-returns metrics (rendered inline inside Performance view on demand)
 # =============================================================================
-def render_rolling_returns_metrics(start_ts: pd.Timestamp = None, end_ts: pd.Timestamp = None):
+def render_rolling_returns_metrics(start_ts: pd.Timestamp = None, end_ts: pd.Timestamp = None,
+                                   rebalance_freq: str = "none", rebalance_label: str = "Buy & hold"):
     """Render 1Y/3Y/5Y rolling return cards plus Max Drawdown comparison.
-    Respects the selected date range (if provided)."""
-    portfolio = build_portfolio(nav, selections, start_ts, end_ts)
+    Respects the selected date range and rebalance frequency."""
+    portfolio = build_portfolio(nav, selections, start_ts, end_ts, rebalance_freq)
     if portfolio.empty:
         st.error("No overlapping data for the selected funds in this date range.")
         return
@@ -687,9 +748,11 @@ def render_rolling_returns_metrics(start_ts: pd.Timestamp = None, end_ts: pd.Tim
 
     period_start = portfolio.index[0].strftime("%b %Y")
     period_end   = portfolio.index[-1].strftime("%b %Y")
+    reb_note = "" if rebalance_freq == "none" else f" · {rebalance_label.lower()} rebalance"
     st.markdown(
         f'<div style="opacity:0.55; font-size:0.85rem; margin: 0.5rem 0 1rem 0;">'
-        f'Based on {backtest_years:.1f} years of selected history ({period_start} to {period_end})'
+        f'Based on {backtest_years:.1f} years of selected history '
+        f'({period_start} to {period_end}){reb_note}'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -821,12 +884,33 @@ def render_performance():
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)
 
-    invest = st.number_input(
-        "Investment amount (₹)", min_value=1000.0, value=100000.0, step=10000.0,
-        key="growth_invest",
-    )
+    c_inv, c_reb = st.columns([1, 1])
+    with c_inv:
+        invest = st.number_input(
+            "Investment amount (₹)", min_value=1000.0, value=100000.0, step=10000.0,
+            key="growth_invest",
+        )
+    with c_reb:
+        rebalance_label = st.selectbox(
+            "Rebalancing",
+            options=["Buy & hold", "Yearly", "Half-yearly", "Quarterly"],
+            index=0,
+            key="growth_rebalance",
+            help=(
+                "Buy & hold leaves the original weights to drift. Rebalancing "
+                "resets your portfolio back to the target weights on a fixed "
+                "schedule — forcing you to sell winners and buy laggards."
+            ),
+        )
+    # Map UI label to internal freq string
+    rebalance_freq = {
+        "Buy & hold":  "none",
+        "Yearly":      "yearly",
+        "Half-yearly": "half-yearly",
+        "Quarterly":   "quarterly",
+    }[rebalance_label]
 
-    portfolio = build_portfolio(nav, selections, start_ts, end_ts)
+    portfolio = build_portfolio(nav, selections, start_ts, end_ts, rebalance_freq)
     if portfolio.empty:
         st.error("No overlapping data in selected date range.")
         return
@@ -837,8 +921,13 @@ def render_performance():
     bench = benchmark.reindex(portfolio.index, method="ffill").bfill()
     bench_normalized = bench / bench.iloc[0]
 
+    # Label the portfolio line — append rebalance suffix when active
+    portfolio_label = "Your Portfolio"
+    if rebalance_freq != "none":
+        portfolio_label = f"Your Portfolio ({rebalance_label.lower()} rebalance)"
+
     chart_df = pd.DataFrame({
-        "Your Portfolio": portfolio.values * invest,
+        portfolio_label: portfolio.values * invest,
         "Nifty 500":      bench_normalized.values * invest,
     }, index=portfolio.index)
 
@@ -866,7 +955,7 @@ def render_performance():
 
     st.markdown(
         f'<div class="chart-stats">'
-        f'  {stat_card("Your Portfolio", "portfolio", p_final, p_return, p_cagr)}'
+        f'  {stat_card(portfolio_label, "portfolio", p_final, p_return, p_cagr)}'
         f'  {stat_card("Nifty 500",      "benchmark", b_final, b_return, b_cagr)}'
         f'</div>',
         unsafe_allow_html=True,
@@ -887,7 +976,7 @@ def render_performance():
             color=alt.Color(
                 "Series:N",
                 scale=alt.Scale(
-                    domain=["Your Portfolio", "Nifty 500"],
+                    domain=[portfolio_label, "Nifty 500"],
                     range=["#3b82f6", "#9ca3af"],
                 ),
                 legend=alt.Legend(title=None, orient="top-left"),
@@ -928,7 +1017,7 @@ def render_performance():
             '<div class="section-label" style="margin-top:1.5rem;">Rolling returns vs Nifty 500</div>',
             unsafe_allow_html=True,
         )
-        render_rolling_returns_metrics(start_ts, end_ts)
+        render_rolling_returns_metrics(start_ts, end_ts, rebalance_freq, rebalance_label)
 
 
 # =============================================================================
