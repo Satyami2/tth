@@ -269,9 +269,9 @@ NAV_FILES = {
 }
 
 BENCHMARK_FILE = "nifty500.parquet"
-ASSETTYPE_FILE = "assettype_allocations.parquet"
-SECTOR_FILE    = "sector_allocation.parquet"
-STOCKS_FILE    = "stock_allocations.parquet"
+ASSETTYPE_FILE = "assets.parquet"
+SECTOR_FILE    = "sectors.parquet"
+STOCKS_FILE    = "stocks.parquet"
 AMFI_FILE      = "AMFI.parquet"
 
 
@@ -440,6 +440,66 @@ def covered_funds(funds: list, df: pd.DataFrame) -> tuple[list, list]:
     return covered, missing
 
 
+# Map each raw asset-type label to one of 4 buckets: Equity / Gold / Debt / Cash.
+# Anything not listed defaults to "Cash" (the safest fold-in for tiny categories
+# like REITs, mutual fund units, silver, derivatives options).
+_ASSET_BUCKET = {
+    # Equity
+    "Domestic Equities":                       "Equity",
+    "Overseas Equities":                       "Equity",
+    "ADRs & GDRs":                             "Equity",
+    "Preference Shares":                       "Equity",
+    "Derivatives-Futures":                     "Equity",
+    # Gold
+    "Gold":                                    "Gold",
+    "Domestic Mutual Funds Units - Gold":      "Gold",
+    # Debt
+    "Government Securities":                   "Debt",
+    "Treasury Bills":                          "Debt",
+    "Corporate Debt":                          "Debt",
+    "Commercial Paper":                        "Debt",
+    "Certificate of Deposit":                  "Debt",
+    "PTC & Securitized Debt":                  "Debt",
+    # Cash
+    "Cash & Cash Equivalents and Net Assets":  "Cash",
+    "Deposits (Placed as Margin)":             "Cash",
+}
+
+
+def bucket_for_asset(asset_type: str) -> str:
+    """Bucket a raw asset-type label. Unknown labels (REITs, Silver, MF Units,
+    options) fold into Cash to keep the 4-bucket view clean."""
+    return _ASSET_BUCKET.get(asset_type, "Cash")
+
+
+def fund_asset_split(fund_name: str) -> dict:
+    """Return {Equity, Gold, Debt, Cash} % split for a single fund (sums to ~100).
+    Uses asset-type data when available, falls back to fund category tag otherwise."""
+    rows = asset_df[asset_df["Scheme"] == fund_name]
+    split = {"Equity": 0.0, "Gold": 0.0, "Debt": 0.0, "Cash": 0.0}
+
+    if not rows.empty:
+        for _, r in rows.iterrows():
+            bucket = bucket_for_asset(r["AssetType"])
+            split[bucket] += float(r["Allocation"])
+        # Normalize in case the data sums to slightly off-100
+        total = sum(split.values())
+        if total > 0:
+            for k in split:
+                split[k] = split[k] * 100.0 / total
+        return split
+
+    # Fallback: classify by category tag
+    cat = fund_info.get(fund_name, {}).get("category", "")
+    if cat == "Gold ETF":
+        split["Gold"] = 100.0
+    elif cat == "Debt":
+        split["Debt"] = 100.0
+    else:
+        split["Equity"] = 100.0
+    return split
+
+
 # =============================================================================
 # Load data
 # =============================================================================
@@ -576,11 +636,13 @@ if not selections:
 
 
 # =============================================================================
-# View routing — only Performance for now.
-# Market Cap / Sectors / Top Stocks render functions are still defined below
-# if you want to re-enable them later.
+# View selector — 4 tabs
 # =============================================================================
-view = "📈 Performance"
+st.markdown('<div class="section-label">What do you want to see?</div>', unsafe_allow_html=True)
+
+views_all = ["📈 Performance", "🥧 Asset Mix", "🏭 Sectors", "🏢 Top Stocks"]
+view = st.radio("View", views_all, horizontal=True, label_visibility="collapsed")
+st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -870,97 +932,81 @@ def render_performance():
 
 
 # =============================================================================
-# VIEW 3: Market Cap
+# VIEW: Asset Mix (Equity / Gold / Debt / Cash split)
 # =============================================================================
-def render_market_cap():
+def render_asset_mix():
     selected_funds = [f for f, _ in selections]
-    covered, missing = covered_funds(selected_funds, stock_df)
 
-    if not covered:
-        st.error("None of your selected funds have holdings data available.")
+    # Aggregate the 4 buckets across the portfolio, weighted by user weights
+    totals = {"Equity": 0.0, "Gold": 0.0, "Debt": 0.0, "Cash": 0.0}
+    funds_no_data = []
+    for f, w in selections:
+        # Was this fund covered by the asset-type file? Track for warning.
+        if asset_df[asset_df["Scheme"] == f].empty:
+            cat = fund_info.get(f, {}).get("category", "")
+            # Only flag as "no data" if we're falling back AND not Gold/Debt category
+            # (those have a clean default rule)
+            if cat not in ("Gold ETF", "Debt"):
+                funds_no_data.append(f)
+
+        split = fund_asset_split(f)  # returns Equity/Gold/Debt/Cash %
+        for k, v in split.items():
+            totals[k] += v * (w / 100.0)
+
+    # Normalize totals so they sum to 100% (corrects for tiny rounding)
+    total_sum = sum(totals.values())
+    if total_sum > 0:
+        for k in totals:
+            totals[k] = totals[k] * 100.0 / total_sum
+    else:
+        st.error("Could not compute asset mix.")
         return
-    if missing:
+
+    if funds_no_data:
         st.info(
-            f"ℹ️ Holdings data unavailable for {len(missing)} fund(s). "
-            "Their weight is excluded from this breakdown."
+            f"ℹ️ Holdings data missing for **{len(funds_no_data)} fund(s)**. "
+            "They've been classified as 100% Equity by default (their actual mix may differ)."
         )
 
-    total_w_covered = sum(w for f, w in selections if f in covered)
-    if total_w_covered <= 0:
-        st.error("No weight allocated to funds with holdings data.")
-        return
+    # Colours per bucket
+    palette = {
+        "Equity": ("#3b82f6", "equity"),
+        "Gold":   ("#fbbf24", "gold"),
+        "Debt":   ("#8b5cf6", "debt"),
+        "Cash":   ("#9ca3af", "cash"),
+    }
 
-    weighted = []
-    for f, w in selections:
-        if f not in covered:
-            continue
-        share = w / total_w_covered
-        rows = stock_df[stock_df["Scheme"] == f].copy()
-        if rows.empty:
-            continue
-        rows["Cap"] = rows["Stock"].apply(lambda s: classify_cap(s, amfi_map))
-        weighted.append(rows.groupby("Cap")["Allocation"].sum() * share)
-    cap_totals = pd.concat(weighted).groupby(level=0).sum() if weighted else pd.Series(dtype=float)
-
-    # Non-equity from asset type
-    non_equity = 0.0
-    at_covered, _ = covered_funds(selected_funds, asset_df)
-    total_w_at = sum(w for f, w in selections if f in at_covered)
-    if total_w_at > 0:
-        for f, w in selections:
-            if f not in at_covered:
-                continue
-            share = w / total_w_at
-            f_at = asset_df[asset_df["Scheme"] == f]
-            ne = f_at[~f_at["AssetType"].str.contains("Equit", case=False, na=False)]
-            non_equity += ne["Allocation"].sum() * share
-
-    large = cap_totals.get("Large Cap", 0.0)
-    mid   = cap_totals.get("Mid Cap",   0.0)
-    small = cap_totals.get("Small Cap", 0.0)
-    cash  = non_equity
-    total = large + mid + small + cash
-    if total <= 0:
-        st.error("Could not compute allocation breakdown.")
-        return
-
-    segs = [
-        ("Large Cap", large, "#3b82f6", "large"),
-        ("Mid Cap",   mid,   "#8b5cf6", "mid"),
-        ("Small Cap", small, "#ec4899", "small"),
-        ("Cash / Debt / Other", cash, "#9ca3af", "cash"),
-    ]
-    scale = 100.0 / total
-    segs = [(n, v * scale, c, cls) for n, v, c, cls in segs]
-
-    st.markdown(
-        '<div style="opacity:0.55; font-size:0.85rem; margin-bottom:1rem;">'
-        'Look-through analysis as of April 2026. Stocks not in AMFI top 250 are classified as Small Cap.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+    segs = [(k, totals[k], palette[k][0], palette[k][1]) for k in ["Equity", "Gold", "Debt", "Cash"]]
 
     bar_segs = "".join(
         f'<div class="stack-seg" style="background:{c}; width:{v:.4f}%;" '
-        f'title="{n}: {v:.1f}%">{v:.0f}%</div>'
-        for n, v, c, _ in segs if v > 0
+        f'title="{n}: {v:.1f}%">{(str(int(round(v))) + "%") if v >= 8 else ""}</div>'
+        for n, v, c, _ in segs if v > 0.01
     )
     legend = "".join(
         f'<div class="legend-row">'
         f'  <div class="legend-left">'
-        f'    <span class="dot {cls}"></span>'
+        f'    <span class="dot" style="background:{palette[n][0]}"></span>'
         f'    <span class="legend-name">{n}</span>'
         f'  </div>'
         f'  <div class="legend-value">{v:.1f}%</div>'
         f'</div>'
-        for n, v, _, cls in segs
+        for n, v, _, _ in segs
+    )
+
+    st.markdown(
+        '<div style="opacity:0.55; font-size:0.85rem; margin-bottom:1rem;">'
+        'Where your money actually sits, by asset class. '
+        'Multi-asset funds are split proportionally across buckets.'
+        '</div>',
+        unsafe_allow_html=True,
     )
 
     st.markdown(
         f'<div class="card">'
         f'  <div class="card-header">'
-        f'    <div class="card-title">Where your money sits</div>'
-        f'    <div class="card-meta">By market cap</div>'
+        f'    <div class="card-title">Asset class split</div>'
+        f'    <div class="card-meta">Equity / Gold / Debt / Cash</div>'
         f'  </div>'
         f'  <div class="stack-bar">{bar_segs}</div>'
         f'  <div class="stack-legend">{legend}</div>'
@@ -970,42 +1016,61 @@ def render_market_cap():
 
 
 # =============================================================================
-# VIEW 4: Sectors
+# VIEW: Sectors (equity portion only)
 # =============================================================================
 def render_sectors():
     selected_funds = [f for f, _ in selections]
     covered, missing = covered_funds(selected_funds, sector_df)
+
     if not covered:
         st.error("None of your selected funds have sector data available.")
         return
-    if missing:
-        st.info(f"ℹ️ Sector data unavailable for {len(missing)} fund(s). Their weight is excluded.")
 
-    total_w = sum(w for f, w in selections if f in covered)
-    if total_w <= 0:
-        st.error("No weight allocated to funds with sector data.")
-        return
-
+    # For each covered fund, multiply (your weight) × (fund's equity portion)
+    # × (sector's allocation within that fund).
     parts = []
+    total_equity_contrib = 0.0
     for f, w in selections:
         if f not in covered:
             continue
-        share = w / total_w
+        split = fund_asset_split(f)
+        equity_pct = split["Equity"] / 100.0  # fraction
+        if equity_pct <= 0:
+            continue
+        share = (w / 100.0) * equity_pct  # share of total portfolio that's this fund's equity
+        total_equity_contrib += share
         rows = sector_df[sector_df["Scheme"] == f]
+        # rows["Allocation"] is in % within the fund's equity portion
         parts.append(rows.groupby("Sector")["Allocation"].sum() * share)
+
+    if not parts or total_equity_contrib <= 0:
+        st.error("No equity allocation found in your portfolio.")
+        return
+
+    # Now sector_totals is in "% of total portfolio that's in this sector"
     sector_totals = pd.concat(parts).groupby(level=0).sum().sort_values(ascending=False)
+
+    # Tell the user how much of their portfolio is being analyzed
+    equity_share = total_equity_contrib * 100
+    excluded = 100.0 - equity_share
+    if missing:
+        st.info(
+            f"ℹ️ Sector data unavailable for {len(missing)} fund(s) — "
+            f"their weight is excluded."
+        )
+
+    st.markdown(
+        f'<div style="opacity:0.55; font-size:0.85rem; margin-bottom:1rem;">'
+        f'Analysing the equity portion of your portfolio (~{equity_share:.0f}%). '
+        f'Numbers shown are <b>% of your total portfolio</b>.'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
     show_n = st.slider("How many sectors to show?", 5, 20, 10, 1, key="sector_n")
     top = sector_totals.head(show_n)
     others = sector_totals.iloc[show_n:].sum()
     max_val = top.max() if not top.empty else 1.0
-
-    st.markdown(
-        f'<div style="opacity:0.55; font-size:0.85rem; margin-bottom:1rem;">'
-        f'Look-through analysis as of April 2026. Top {show_n} of {len(sector_totals)} sectors.'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
 
     rows_html = ""
     for sector, value in top.items():
@@ -1034,7 +1099,7 @@ def render_sectors():
     st.markdown(
         f'<div class="card">'
         f'  <div class="card-header">'
-        f'    <div class="card-title">Sector exposure</div>'
+        f'    <div class="card-title">Sector exposure (equity only)</div>'
         f'    <div class="card-meta">Top {show_n} sectors</div>'
         f'  </div>'
         f'  {rows_html}'
@@ -1044,7 +1109,7 @@ def render_sectors():
 
 
 # =============================================================================
-# VIEW 5: Top Stocks
+# VIEW: Top Stocks (equity portion only)
 # =============================================================================
 def render_top_stocks():
     selected_funds = [f for f, _ in selections]
@@ -1052,44 +1117,49 @@ def render_top_stocks():
     if not covered:
         st.error("None of your selected funds have stock-holdings data available.")
         return
-    if missing:
-        st.info(f"ℹ️ Stock data unavailable for {len(missing)} fund(s). Their weight is excluded.")
-
-    total_w = sum(w for f, w in selections if f in covered)
-    if total_w <= 0:
-        st.error("No weight allocated to funds with stock data.")
-        return
 
     parts = []
+    total_equity_contrib = 0.0
     for f, w in selections:
         if f not in covered:
             continue
-        share = w / total_w
+        split = fund_asset_split(f)
+        equity_pct = split["Equity"] / 100.0
+        if equity_pct <= 0:
+            continue
+        share = (w / 100.0) * equity_pct
+        total_equity_contrib += share
         rows = stock_df[stock_df["Scheme"] == f]
         parts.append(rows.groupby("Stock")["Allocation"].sum() * share)
+
+    if not parts or total_equity_contrib <= 0:
+        st.error("No equity holdings found in your portfolio.")
+        return
+
     stock_totals = pd.concat(parts).groupby(level=0).sum().sort_values(ascending=False)
 
-    show_n = st.slider("How many stocks to show?", 5, 25, 10, 1, key="stocks_n")
-    top = stock_totals.head(show_n)
+    if missing:
+        st.info(f"ℹ️ Stock data unavailable for {len(missing)} fund(s) — their weight is excluded.")
 
+    equity_share = total_equity_contrib * 100
     st.markdown(
         f'<div style="opacity:0.55; font-size:0.85rem; margin-bottom:1rem;">'
-        f'Look-through analysis as of April 2026. Top {show_n} of {len(stock_totals):,} unique stocks.'
+        f'Analysing the equity portion of your portfolio (~{equity_share:.0f}%). '
+        f'Numbers shown are <b>% of your total portfolio</b>. '
+        f'{len(stock_totals):,} unique stocks found.'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-    cap_color = {"Large Cap": "large", "Mid Cap": "mid", "Small Cap": "small"}
-    cap_short = {"Large Cap": "Large", "Mid Cap": "Mid", "Small Cap": "Small"}
+    show_n = st.slider("How many stocks to show?", 5, 25, 10, 1, key="stocks_n")
+    top = stock_totals.head(show_n)
+
     rows_html = ""
     for i, (stock, value) in enumerate(top.items(), start=1):
-        cap = classify_cap(stock, amfi_map)
-        cls = cap_color[cap]
         rows_html += (
-            f'<div class="stock-row">'
+            f'<div class="stock-row" style="grid-template-columns: 28px 1fr 80px;">'
             f'  <div class="stock-rank">{i:02d}</div>'
             f'  <div class="stock-name">{stock}</div>'
-            f'  <div class="cap-badge {cls}">{cap_short[cap]}</div>'
             f'  <div class="stock-pct">{value:.2f}%</div>'
             f'</div>'
         )
@@ -1112,8 +1182,8 @@ def render_top_stocks():
 # =============================================================================
 if view.endswith("Performance"):
     render_performance()
-elif view.endswith("Market Cap"):
-    render_market_cap()
+elif view.endswith("Asset Mix"):
+    render_asset_mix()
 elif view.endswith("Sectors"):
     render_sectors()
 elif view.endswith("Top Stocks"):
